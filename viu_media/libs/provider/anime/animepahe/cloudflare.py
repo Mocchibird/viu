@@ -1,18 +1,23 @@
-"""Clears animepahe's Cloudflare challenge with a local Chromium-family browser.
+"""Clears animepahe's Cloudflare challenge with a locally installed browser.
 
 Cloudflare binds the ``cf_clearance`` cookie to the User-Agent of the browser that
 solved the challenge, so the provider has to replay that exact User-Agent along with
-the cookies. Headless browsers never pass the challenge; a normal, minimized window
-does, usually in under ten seconds. The browser is started in the background so it
-never takes focus or pulls the user out of a full-screen app, and the result is
-cached so later runs start without a browser until Cloudflare asks again.
+the cookies. The result is cached so later runs start without a browser until
+Cloudflare asks again.
+
+Headless Firefox passes the challenge in a few seconds without ever showing a window,
+so it is tried first. Headless Chromium browsers are always caught, so the fallback
+runs one with a real, minimized window, which can still pull the user out of a
+full-screen app on macOS.
 """
 
+import http.server
 import json
 import logging
 import os
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -22,8 +27,10 @@ import urllib.request
 from pathlib import Path
 from typing import Optional, TypedDict
 
+import httpx
+
 from .....core.constants import APP_CACHE_DIR
-from .constants import ANIMEPAHE, ANIMEPAHE_BASE
+from .constants import ANIMEPAHE, ANIMEPAHE_BASE, ANIMEPAHE_ENDPOINT
 
 logger = logging.getLogger(__name__)
 
@@ -33,13 +40,23 @@ CLEARANCE_FILE = APP_CACHE_DIR / "animepahe-clearance.json"
 # an interactive challenge, and the total wait before giving up.
 HIDDEN_WAIT = 30
 TOTAL_WAIT = 180
+# Headless Firefox needs no interaction, so give up on it sooner.
+FIREFOX_WAIT = 45
 
+_MACOS_FIREFOX = [
+    "Firefox.app/Contents/MacOS/firefox",
+    "Firefox Developer Edition.app/Contents/MacOS/firefox",
+    "Firefox Nightly.app/Contents/MacOS/firefox",
+]
+_WINDOWS_FIREFOX = [r"Mozilla Firefox\firefox.exe"]
+_LINUX_FIREFOX = ["firefox", "firefox-esr"]
+
+# Brave Origin is left out: every fresh profile opens on its activation screen.
 _MACOS_BROWSERS = [
     "Google Chrome.app/Contents/MacOS/Google Chrome",
     "Chromium.app/Contents/MacOS/Chromium",
     "Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
     "Brave Browser.app/Contents/MacOS/Brave Browser",
-    "Brave Origin.app/Contents/MacOS/Brave Origin",
     "Vivaldi.app/Contents/MacOS/Vivaldi",
     "Opera.app/Contents/MacOS/Opera",
     "Opera GX.app/Contents/MacOS/Opera",
@@ -92,24 +109,38 @@ def refresh_clearance(stale: Optional[Clearance]) -> Clearance:
         return clearance
 
 
-def find_browser() -> Optional[str]:
-    override = os.environ.get("VIU_BROWSER")
-    if override:
-        return override
+def _is_firefox(path: str) -> bool:
+    return "firefox" in Path(path).name.lower()
+
+
+def _find(macos: list[str], windows: list[str], linux: list[str]) -> Optional[str]:
     if sys.platform == "darwin":
         roots = [Path("/Applications"), Path.home() / "Applications"]
-        candidates = [root / rel for rel in _MACOS_BROWSERS for root in roots]
+        candidates = [root / rel for rel in macos for root in roots]
     elif sys.platform == "win32":
         roots = [
             os.environ.get(var)
             for var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")
         ]
-        candidates = [
-            Path(root) / rel for rel in _WINDOWS_BROWSERS for root in roots if root
-        ]
+        candidates = [Path(root) / rel for rel in windows for root in roots if root]
     else:
-        candidates = [Path(p) for p in map(shutil.which, _LINUX_BROWSERS) if p]
+        candidates = [Path(p) for p in map(shutil.which, linux) if p]
     return next((str(c) for c in candidates if c.is_file()), None)
+
+
+def find_firefox() -> Optional[str]:
+    override = os.environ.get("VIU_BROWSER")
+    if override:
+        return override if _is_firefox(override) else None
+    return _find(_MACOS_FIREFOX, _WINDOWS_FIREFOX, _LINUX_FIREFOX)
+
+
+def find_browser() -> Optional[str]:
+    """Find a Chromium-based browser for the windowed fallback."""
+    override = os.environ.get("VIU_BROWSER")
+    if override:
+        return None if _is_firefox(override) else override
+    return _find(_MACOS_BROWSERS, _WINDOWS_BROWSERS, _LINUX_BROWSERS)
 
 
 def _free_port() -> int:
@@ -165,14 +196,129 @@ def _launch(browser: str, args: list[str]) -> Optional[subprocess.Popen]:
 
 
 def _solve() -> Clearance:
+    firefox = find_firefox()
+    if firefox:
+        try:
+            return _solve_with_firefox(firefox)
+        except CloudflareError as e:
+            logger.warning(f"{e}; trying a Chromium-based browser instead")
     browser = find_browser()
     if not browser:
         raise CloudflareError(
-            "animepahe is behind a Cloudflare challenge and no Chromium-based browser "
-            "(Chrome, Edge, Brave, Chromium, Vivaldi, Opera) was found to clear it. "
-            "Install one or point VIU_BROWSER at its executable."
+            "animepahe is behind a Cloudflare challenge and no browser that can clear "
+            "it was found. Install Firefox (or Chrome, Edge, Brave, Chromium, "
+            "Vivaldi, Opera), or point VIU_BROWSER at one."
         )
+    return _solve_with_chromium(browser)
 
+
+def _firefox_cookies(profile: str) -> dict[str, str]:
+    """Read animepahe's cookies from a running Firefox's cookie database."""
+    database = Path(profile) / "cookies.sqlite"
+    if not database.exists():
+        return {}
+    # Firefox holds the database open, so read a copy (with its write-ahead log).
+    copy_dir = tempfile.mkdtemp(prefix="viu-cookies-")
+    try:
+        for suffix in ("", "-wal"):
+            source = Path(f"{database}{suffix}")
+            if source.exists():
+                shutil.copy(source, Path(copy_dir) / f"cookies.sqlite{suffix}")
+        connection = sqlite3.connect(Path(copy_dir) / "cookies.sqlite")
+        try:
+            rows = connection.execute(
+                "SELECT name, value FROM moz_cookies WHERE host IN (?, ?)",
+                (ANIMEPAHE, f".{ANIMEPAHE}"),
+            ).fetchall()
+        finally:
+            connection.close()
+        return dict(rows)
+    except (OSError, sqlite3.Error):
+        return {}
+    finally:
+        shutil.rmtree(copy_dir, ignore_errors=True)
+
+
+def _solve_with_firefox(firefox: str) -> Clearance:
+    # Firefox runs with no remote-control protocol, which Cloudflare would notice,
+    # so a local page records its User-Agent and redirects it to animepahe.
+    seen: dict[str, str] = {}
+
+    class RecordUserAgent(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            seen["user_agent"] = self.headers["User-Agent"]
+            self.send_response(302)
+            self.send_header("Location", f"{ANIMEPAHE_BASE}/")
+            self.end_headers()
+
+        def log_message(self, format, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), RecordUserAgent)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    profile = tempfile.mkdtemp(prefix="viu-cloudflare-")
+    (Path(profile) / "user.js").write_text(
+        'user_pref("browser.shell.checkDefaultBrowser", false);\n'
+        'user_pref("browser.startup.homepage_override.mstone", "ignore");\n'
+        'user_pref("browser.aboutwelcome.enabled", false);\n'
+        'user_pref("datareporting.policy.dataSubmissionEnabled", false);\n'
+        'user_pref("toolkit.telemetry.reportingpolicy.firstRun", false);\n'
+        'user_pref("app.update.enabled", false);\n'
+    )
+    process = subprocess.Popen(
+        [
+            firefox,
+            "--headless",
+            "--no-remote",
+            "--profile",
+            profile,
+            f"http://127.0.0.1:{server.server_port}/",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={**os.environ, "MOZ_HEADLESS": "1"},
+    )
+    logger.info(f"Clearing animepahe's Cloudflare challenge with headless {firefox}")
+    started = time.monotonic()
+    try:
+        with httpx.Client(http2=True, timeout=15) as client:
+            while time.monotonic() - started < FIREFOX_WAIT:
+                time.sleep(1)
+                if process.poll() is not None:
+                    raise CloudflareError(
+                        f"{firefox} exited before clearing Cloudflare"
+                    )
+                cookies = _firefox_cookies(profile)
+                if "cf_clearance" not in cookies or "user_agent" not in seen:
+                    continue
+                # Cloudflare sets cf_clearance before the check passes, so only a
+                # real answer from the API proves the cookie works.
+                response = client.get(
+                    ANIMEPAHE_ENDPOINT,
+                    params={"m": "search", "q": "naruto"},
+                    headers={"User-Agent": seen["user_agent"]},
+                    cookies=cookies,
+                )
+                if response.status_code == 200:
+                    logger.info(
+                        f"Cloudflare cleared in {time.monotonic() - started:.0f}s"
+                    )
+                    return {"user_agent": seen["user_agent"], "cookies": cookies}
+        raise CloudflareError(
+            f"headless Firefox did not clear Cloudflare within {FIREFOX_WAIT}s"
+        )
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        server.shutdown()
+        server.server_close()
+        shutil.rmtree(profile, ignore_errors=True)
+
+
+def _solve_with_chromium(browser: str) -> Clearance:
     port = _free_port()
     profile = tempfile.mkdtemp(prefix="viu-cloudflare-")
     process = _launch(
