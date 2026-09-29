@@ -4,7 +4,13 @@ import re
 
 from viu_media.core.utils.fuzzy import fuzz
 from viu_media.core.utils.normalizer import normalize_title
-from viu_media.libs.provider.anime.types import SearchResult, ProviderName
+from viu_media.libs.provider.anime.base import BaseAnimeProvider
+from viu_media.libs.provider.anime.params import SearchParams
+from viu_media.libs.provider.anime.types import (
+    SearchResult,
+    SearchResults,
+    ProviderName,
+)
 from viu_media.libs.media_api.types import MediaItem
 
 # "Season 2", "2nd Season", "Part 2" and "II" all name the same sequel, but plain
@@ -15,6 +21,9 @@ _SEQUEL_MARKER = re.compile(
 _ROMAN_NUMERALS = {"ii": "2", "iii": "3", "iv": "4", "vi": "6", "vii": "7", "viii": "8"}
 _FORMAT_BONUS = 5
 _YEAR_BONUS = 5
+# Right matches score 100+ with their bonuses; a best score this low means the
+# search never returned the show at all.
+_CONFIDENT_MATCH = 85
 
 
 def _canonical(title: str) -> str:
@@ -66,3 +75,40 @@ def find_best_match_title(
             provider_results_map[p_title], provider, media_item
         ),
     )
+
+
+def search_provider(
+    provider: BaseAnimeProvider,
+    provider_name: ProviderName,
+    media_item: MediaItem,
+    translation_type: str = "sub",
+) -> SearchResults | None:
+    """Search the provider by the media's english title, then by its romaji title
+    if the english search found nothing that confidently matches.
+
+    Provider search is literal: animepahe finds "Re:ZERO -Starting Life in Another
+    World- Season 2 Part 2" by its romaji title but not by its english one.
+    """
+    found: SearchResults | None = None
+    titles = dict.fromkeys(
+        t for t in (media_item.title.english, media_item.title.romaji) if t
+    )
+    for title in titles:
+        results = provider.search(
+            SearchParams(
+                query=normalize_title(title, provider_name.value, True).lower(),
+                translation_type=translation_type,  # type: ignore[arg-type]
+            )
+        )
+        if not results or not results.results:
+            continue
+        if found is None:
+            # copy, since providers cache the results they return
+            found = results.model_copy(update={"results": list(results.results)})
+        else:
+            seen = {r.id for r in found.results}
+            found.results.extend(r for r in results.results if r.id not in seen)
+        best = max(_match_score(r, provider_name, media_item) for r in found.results)
+        if best >= _CONFIDENT_MATCH:
+            break
+    return found

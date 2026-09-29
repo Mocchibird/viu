@@ -44,6 +44,9 @@ class AnimePahe(BaseAnimeProvider):
             httpx.Client(http2=True, headers=client.headers, timeout=client.timeout)
         )
         client.close()
+        # Every search result seen so far, so get() can find an anime that a
+        # different query than its own surfaced (a synonym or romaji search).
+        self._seen_results: dict[str, SearchResult] = {}
         self._clearance = cloudflare.load_clearance()
         if self._clearance:
             self._apply_clearance(self._clearance)
@@ -97,7 +100,9 @@ class AnimePahe(BaseAnimeProvider):
         data: AnimePaheSearchPage = response.json()
         if not data.get("data"):
             return
-        return map_to_search_results(data)
+        results = map_to_search_results(data)
+        self._seen_results.update((result.id, result) for result in results.results)
+        return results
 
     @debug_provider
     def get(self, params: AnimeParams) -> Anime | None:
@@ -146,6 +151,8 @@ class AnimePahe(BaseAnimeProvider):
 
     @lru_cache()
     def _get_search_result(self, params: AnimeParams) -> Optional[SearchResult]:
+        if params.id in self._seen_results:
+            return self._seen_results[params.id]
         search_results = self._search(SearchParams(query=params.query))
         if not search_results or not search_results.results:
             logger.error(f"No search results found for ID {params.id}")

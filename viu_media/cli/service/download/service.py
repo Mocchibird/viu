@@ -2,18 +2,16 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, List
 
-from viu_media.cli.utils.search import find_best_match_title
+from viu_media.cli.utils.search import find_best_match_title, search_provider
 
 from ....core.config.model import AppConfig
 from ....core.constants import APP_CACHE_DIR
 from ....core.downloader import DownloadParams, create_downloader
 from ....core.utils.concurrency import ManagedBackgroundWorker, thread_manager
-from ....core.utils.normalizer import normalize_title
 from ....libs.media_api.types import MediaItem
 from ....libs.provider.anime.params import (
     AnimeParams,
     EpisodeStreamsParams,
-    SearchParams,
 )
 from ..registry.models import DownloadStatus
 
@@ -187,13 +185,11 @@ class DownloadService:
             media_title = media_item.title.romaji or media_item.title.english
 
             # 1. Search the provider to get the provider-specific ID
-            provider_search_results = self.provider.search(
-                SearchParams(
-                    query=normalize_title(
-                        media_title, self.app_config.general.provider.value, True
-                    ),
-                    translation_type=self.app_config.stream.translation_type,
-                )
+            provider_search_results = search_provider(
+                self.provider,
+                self.app_config.general.provider,
+                media_item,
+                self.app_config.stream.translation_type,
             )
 
             if not provider_search_results or not provider_search_results.results:

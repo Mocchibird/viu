@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 @session.menu
 def provider_search(ctx: Context, state: State) -> State | InternalDirective:
-    from viu_media.cli.utils.search import find_best_match_title
+    from viu_media.cli.utils.search import find_best_match_title, search_provider
 
     from .....core.utils.normalizer import normalize_title, update_user_normalizer_json
 
@@ -29,13 +29,8 @@ def provider_search(ctx: Context, state: State) -> State | InternalDirective:
         )
         return InternalDirective.BACK
 
-    provider_search_results = provider.search(
-        SearchParams(
-            query=normalize_title(
-                media_title, config.general.provider.value, True
-            ).lower(),
-            translation_type=config.stream.translation_type,
-        )
+    provider_search_results = search_provider(
+        provider, config.general.provider, media_item, config.stream.translation_type
     )
 
     if not provider_search_results or not provider_search_results.results:

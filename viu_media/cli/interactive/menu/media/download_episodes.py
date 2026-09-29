@@ -1,4 +1,4 @@
-from .....libs.provider.anime.params import AnimeParams, SearchParams
+from .....libs.provider.anime.params import AnimeParams
 from ...session import Context, session
 from ...state import InternalDirective, State
 
@@ -6,8 +6,7 @@ from ...state import InternalDirective, State
 @session.menu
 def download_episodes(ctx: Context, state: State) -> State | InternalDirective:
     """Menu to select and download episodes synchronously."""
-    from viu_media.cli.utils.search import find_best_match_title
-    from .....core.utils.normalizer import normalize_title
+    from viu_media.cli.utils.search import find_best_match_title, search_provider
 
     feedback = ctx.feedback
     selector = ctx.selector
@@ -28,10 +27,11 @@ def download_episodes(ctx: Context, state: State) -> State | InternalDirective:
     with feedback.progress(
         f"Searching for '{media_title}' on {provider.__class__.__name__}..."
     ):
-        provider_search_results = provider.search(
-            SearchParams(
-                query=normalize_title(media_title, config.general.provider.value, True)
-            )
+        provider_search_results = search_provider(
+            provider,
+            config.general.provider,
+            media_item,
+            config.stream.translation_type,
         )
 
     if not provider_search_results or not provider_search_results.results:
