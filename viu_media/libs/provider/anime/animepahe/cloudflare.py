@@ -293,7 +293,8 @@ def _wait_for_exit(port: int, profile: str) -> None:
         try:
             _devtools_json(port, "/json/version")
         except OSError:
-            return
+            break
         time.sleep(0.1)
-    # The throwaway profile path is unique, so this only matches our instance.
+    # Also catches a browser that was still starting when we gave up on it. The
+    # throwaway profile path is unique, so this only ever matches our instance.
     subprocess.run(["pkill", "-f", profile], check=False)
