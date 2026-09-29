@@ -1,16 +1,19 @@
 import logging
+import time
 from functools import lru_cache
 from typing import Iterator, Optional
-from urllib.parse import urlparse
+
+import httpx
 
 from ..base import BaseAnimeProvider
 from ..params import AnimeParams, EpisodeStreamsParams, SearchParams
 from ..types import Anime, AnimeEpisodeInfo, SearchResult, SearchResults, Server
 from ..utils.debug import debug_provider
+from . import cloudflare
 from .constants import (
+    ANIMEPAHE,
     ANIMEPAHE_BASE,
     ANIMEPAHE_ENDPOINT,
-    CDN_PROVIDER,
     JUICY_STREAM_REGEX,
     REQUEST_HEADERS,
     SERVER_HEADERS,
@@ -18,13 +21,70 @@ from .constants import (
 )
 from .extractor import process_animepahe_embed_page
 from .mappers import map_to_anime_result, map_to_search_results, map_to_server
+from .relay import get_relay
 from .types import AnimePaheAnimePage, AnimePaheSearchPage
 
 logger = logging.getLogger(__name__)
 
 
+def _is_challenge(response: httpx.Response) -> bool:
+    return response.status_code in (403, 503) and (
+        response.headers.get("cf-mitigated") == "challenge"
+        or "<title>Just a moment...</title>" in response.text
+    )
+
+
 class AnimePahe(BaseAnimeProvider):
     HEADERS = REQUEST_HEADERS
+
+    def __init__(self, client: httpx.Client) -> None:
+        # Cloudflare rejects HTTP/1.1 outright on animepahe, kwik and the stream CDN,
+        # so this provider needs an HTTP/2 client of its own.
+        super().__init__(
+            httpx.Client(http2=True, headers=client.headers, timeout=client.timeout)
+        )
+        client.close()
+        self._clearance = cloudflare.load_clearance()
+        if self._clearance:
+            self._apply_clearance(self._clearance)
+
+    def _apply_clearance(self, clearance: cloudflare.Clearance) -> None:
+        # cf_clearance only counts when sent with the User-Agent that earned it.
+        self.client.headers["User-Agent"] = clearance["user_agent"]
+        for name, value in clearance["cookies"].items():
+            self.client.cookies.set(name, value, domain=f".{ANIMEPAHE}")
+
+    def _send(self, url: str, **kwargs) -> httpx.Response:
+        # animepahe allows a burst of about eight API calls, then answers 429 with a
+        # Retry-After, which long series hit while paging through their episodes.
+        for _ in range(3):
+            response = self.client.get(url, **kwargs)
+            if response.status_code != 429:
+                break
+            delay = min(float(response.headers.get("Retry-After", 5)), 15)
+            logger.info(f"animepahe rate limited the request; retrying in {delay}s")
+            time.sleep(delay)
+        return response
+
+    def _get(self, url: str, **kwargs) -> httpx.Response:
+        """GET an animepahe URL, clearing the Cloudflare challenge if one comes back."""
+        response = self._send(url, **kwargs)
+        if _is_challenge(response):
+            logger.info("animepahe answered with a Cloudflare challenge")
+            self._clearance = cloudflare.refresh_clearance(self._clearance)
+            self._apply_clearance(self._clearance)
+            response = self._send(url, **kwargs)
+            if _is_challenge(response):
+                raise cloudflare.CloudflareError(
+                    "animepahe still sent a Cloudflare challenge after it was cleared"
+                )
+        if response.status_code == 403 and "Attention Required!" in response.text:
+            raise cloudflare.CloudflareError(
+                "Cloudflare blocked the request outright; animepahe needs HTTP/2 and "
+                "the User-Agent of the browser that cleared the challenge"
+            )
+        response.raise_for_status()
+        return response
 
     @debug_provider
     def search(self, params: SearchParams) -> SearchResults | None:
@@ -33,8 +93,7 @@ class AnimePahe(BaseAnimeProvider):
     @lru_cache()
     def _search(self, params: SearchParams) -> SearchResults | None:
         url_params = {"m": "search", "q": params.query}
-        response = self.client.get(ANIMEPAHE_ENDPOINT, params=url_params)
-        response.raise_for_status()
+        response = self._get(ANIMEPAHE_ENDPOINT, params=url_params)
         data: AnimePaheSearchPage = response.json()
         if not data.get("data"):
             return
@@ -103,8 +162,7 @@ class AnimePahe(BaseAnimeProvider):
             "sort": sort,
             "page": page,
         }
-        response = self.client.get(ANIMEPAHE_ENDPOINT, params=url_params)
-        response.raise_for_status()
+        response = self._get(ANIMEPAHE_ENDPOINT, params=url_params)
         return response.json()
 
     @debug_provider
@@ -123,8 +181,7 @@ class AnimePahe(BaseAnimeProvider):
             return
 
         url = f"{ANIMEPAHE_BASE}/play/{params.anime_id}/{episode.session_id}"
-        response = self.client.get(url, follow_redirects=True)
-        response.raise_for_status()
+        response = self._get(url, follow_redirects=True)
 
         c = get_element_by_id("resolutionMenu", response.text)
         if not c:
@@ -135,7 +192,6 @@ class AnimePahe(BaseAnimeProvider):
         quality = None
         translation_type = None
         stream_links = []
-        stream_host = None
 
         # TODO: better document the scraping process
         for res_dict in res_dicts:
@@ -174,20 +230,24 @@ class AnimePahe(BaseAnimeProvider):
                 continue
             logger.debug(f"Found juicy stream: {juicy_stream.group(1)}")
             juicy_stream = juicy_stream.group(1)
-            stream_host = urlparse(juicy_stream).hostname
             quality = res_dict["resolution"]
             logger.debug(f"Found quality: {quality}")
             translation_type = data_audio
             stream_links.append((quality, juicy_stream))
 
         if translation_type and stream_links:
-            headers = {
-                "User-Agent": self.client.headers["User-Agent"],
-                "Host": stream_host or CDN_PROVIDER,
-                **STREAM_HEADERS,
-            }
+            # The CDN only answers HTTP/2, which players can't speak, so hand them
+            # local relay URLs that fetch the stream over HTTP/2 on their behalf.
+            user_agent = self.client.headers["User-Agent"]
+            relay = get_relay({"User-Agent": user_agent, **STREAM_HEADERS})
+            stream_links = [
+                (quality, relay.url_for(link)) for quality, link in stream_links
+            ]
             yield map_to_server(
-                episode, translation_type, stream_links, headers=headers
+                episode,
+                translation_type,
+                stream_links,
+                headers={"User-Agent": user_agent},
             )
 
     @lru_cache()
